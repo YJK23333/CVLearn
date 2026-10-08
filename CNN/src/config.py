@@ -3,7 +3,7 @@
 
 class Config:
     # datas
-    data_root = "./dataset"
+    data_root = "./data"
     num_classes = 10
     image_size = 32
 
