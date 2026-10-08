@@ -1,0 +1,37 @@
+# 目录
+data/
+dataset/
+datasets/
+checkpoint/
+checkpoints/
+weights/
+pretrained/
+logs/
+runs/
+outputs/
+results/
+__pycache__/
+
+# 文件类型
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.h5
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.log
+events.out.tfevents.*
+*.tfevents.*
+
+# 环境 / 编辑器 / 系统
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
