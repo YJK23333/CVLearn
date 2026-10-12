@@ -37,7 +37,7 @@ def get_datasets(data_root = "./data"):
     return train_set, test_set
 
 
-def get_dataloader(data_root = "./data",
+def get_dataloaders(data_root = "./data",
                    batch_size = 128,
                    num_workers = 2):
     train_set, test_set = get_datasets(data_root)
