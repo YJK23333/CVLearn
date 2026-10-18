@@ -20,7 +20,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[info] device = {device}")
 
-    # ---------------- data ----------------
+    # data
     train_set = SiameseMNIST(
         root=cfg.data_root, train=True,
         num_pairs=cfg.num_train_pairs,
@@ -43,7 +43,7 @@ def main():
         num_workers=cfg.num_workers, pin_memory=True,
     )
 
-    # ---------------- model ----------------
+    # model
     embedding_net = EmbeddingNet(embedding_dim=cfg.embedding_dim)
     model = SiameseNet(embedding_net).to(device)
 
@@ -80,8 +80,7 @@ def main():
 
         avg_loss = total_loss / len(train_loader)
 
-        # ---------------- validate ----------------
-        # evaluate 会先跑一遍 val_loader 收集距离，再扫阈值找最佳准确率
+        # validate
         acc, thr = evaluate(model, val_loader, device)
         print(f"[epoch {epoch}] loss {avg_loss:.4f} | val_acc {acc:.4f} "
               f"| best_thr {thr:.3f} | {time.time() - t0:.1f}s")

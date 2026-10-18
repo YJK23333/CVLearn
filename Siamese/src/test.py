@@ -1,12 +1,3 @@
-"""
-评估 / 使用训练好的 Siamese 网络。
-
-包含三个部分：
-  1. evaluate()          —— 训练时调用的评估函数
-  2. plot_distance_hist  —— 画正/负样本对的距离分布
-  3. plot_pairs / tsne   —— 可视化样本对和 embedding
-"""
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,12 +7,9 @@ from dataset import SiameseMNIST
 from model import EmbeddingNet, SiameseNet
 
 
-# ============================================================
-# 1. 评估部分（被 train.py 调用）
-# ============================================================
+
 @torch.no_grad()
 def compute_distances(model, loader, device):
-    """跑一遍 loader，收集所有 embedding 的 L2 距离和真实标签。"""
     model.eval()
     all_dist, all_label = [], []
 
@@ -37,13 +25,7 @@ def compute_distances(model, loader, device):
 
     return torch.cat(all_dist).numpy(), torch.cat(all_label).numpy()
 
-
 def best_threshold(distances, labels, num=200):
-    """
-    在 [min, max] 上均匀扫阈值：
-        距离 < 阈值 → 判为同类；否则判为不同类
-    返回 (最佳准确率, 最佳阈值)
-    """
     thresholds = np.linspace(distances.min(), distances.max(), num)
 
     best_acc, best_thr = 0.0, 0.0
@@ -55,16 +37,12 @@ def best_threshold(distances, labels, num=200):
 
     return best_acc, best_thr
 
-
-def evaluate(model, loader, device, margin=1.0):
-    """训练过程中使用：返回 (准确率, 最佳阈值)。"""
+def evaluate(model, loader, device):
     distances, labels = compute_distances(model, loader, device)
     return best_threshold(distances, labels)
 
 
-# ============================================================
-# 2. 可视化部分（只有直接运行 test.py 时才用到）
-# ============================================================
+
 def plot_distance_hist(distances, labels, threshold, save_path):
     import matplotlib
     matplotlib.use("Agg")
@@ -87,7 +65,6 @@ def plot_distance_hist(distances, labels, threshold, save_path):
 
 
 def plot_pairs(model, dataset, device, save_path, n=8):
-    """随机抽 n 个样本对，画出来并标注距离。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -119,7 +96,6 @@ def plot_pairs(model, dataset, device, save_path, n=8):
 
 
 def plot_tsne(model, root, device, save_path, n=2000):
-    """把 embedding 用 t-SNE 降到 2 维，看看类别是否分得开。"""
     try:
         from sklearn.manifold import TSNE
     except ImportError:
@@ -158,9 +134,7 @@ def plot_tsne(model, root, device, save_path, n=2000):
     print(f"[saved] {save_path}")
 
 
-# ============================================================
-# 3. 直接运行 test.py 时的入口
-# ============================================================
+
 def main():
     import argparse
 
@@ -173,7 +147,6 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---------- 加载模型 ----------
     ckpt = torch.load(args.ckpt, map_location=device)
     embedding_net = EmbeddingNet(embedding_dim=ckpt["embedding_dim"]).to(device)
     embedding_net.load_state_dict(ckpt["embedding_net"])
@@ -183,7 +156,6 @@ def main():
     print(f"[info] loaded {args.ckpt}, saved val_acc = {ckpt.get('val_acc'):.4f}, "
           f"saved threshold = {ckpt.get('threshold'):.4f}")
 
-    # ---------- 评估 ----------
     val_set = SiameseMNIST(root=args.root, train=False,
                            num_pairs=args.num_pairs, seed=123)
     loader = DataLoader(val_set, batch_size=args.batch_size,

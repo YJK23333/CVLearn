@@ -18,7 +18,7 @@ class Config:
     batch_size = 128
     lr = 1e-3
     weight_decay = 1e-5
-    epochs = 30
+    epochs = 10
     num_workers = 2
     seed = 42
     log_interval = 100
