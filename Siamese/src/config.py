@@ -3,6 +3,7 @@
 
 class Config:
     # data
+    dataset = "MNIST"
     data_root = "../../data"
     num_train_pairs = 60000
     num_val_pairs = 10000
@@ -10,6 +11,7 @@ class Config:
 
     # model
     embedding_dim = 128
+    in_channels = 1
 
     # loss
     margin = 1.0

@@ -1,84 +1,110 @@
+
 from pathlib import Path
 import torch
 
+
+# ============================================================
+# 1. Project Paths
+# ============================================================
+
 SRC_DIR = Path(__file__).resolve().parent
-UNET_DIR = SRC_DIR.parent
-PROJECT_ROOT = UNET_DIR.parent
+PROJECT_DIR = SRC_DIR.parent
+ROOT_DIR = PROJECT_DIR.parent
 
-DATA_ROOT = PROJECT_ROOT / "data"
-DATASET_ROOT = DATA_ROOT / "oxford-iiit-pet"
-CHECKPOINT_DIR = UNET_DIR / "checkpoints"
-OUTPUT_DIR = UNET_DIR / "outputs"
-LOG_DIR = OUTPUT_DIR / "logs"
-PREDICTION_DIR = OUTPUT_DIR / "predictions"
+DATASET_ROOT = ROOT_DIR / "data" / "oxford-iiit-pet"
 
-# ============================================================
-# Dataset configuration
-# ============================================================
-DATASET_NAME = "Oxford-IIIT Pet"
-TRAINVAL_SPLIT = "trainval"
-OFFICIAL_TEST_SPLIT = "test"
-VALIDATION_RATIO = 0.15
-DOWNLOAD_DATASET = True
+IMAGE_DIR = DATASET_ROOT / "images"
+ANNOTATION_DIR = DATASET_ROOT / "annotations"
+TRIMAP_DIR = ANNOTATION_DIR / "trimaps"
 
-# Oxford-IIIT Pet trimap values:
-# 1 = pet, 2 = background, 3 = uncertain boundary.
-# For this starter binary task, boundary pixels are treated as pet.
-PET_MASK_VALUES = (1, 3)
-BACKGROUND_MASK_VALUE = 2
+TRAINVAL_FILE = ANNOTATION_DIR / "trainval.txt"
+TEST_FILE = ANNOTATION_DIR / "test.txt"
+
+CHECKPOINT_DIR = PROJECT_DIR / "checkpoints"
+RUN_DIR = PROJECT_DIR / "runs"
+
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ============================================================
-# Input / output configuration
+# 2. Dataset Configuration
 # ============================================================
-IMAGE_HEIGHT = 256
-IMAGE_WIDTH = 256
-IMAGE_SIZE = (IMAGE_HEIGHT, IMAGE_WIDTH)
-IMAGE_CHANNELS = 3
-NUM_CLASSES = 1  # binary segmentation: one logit channel
 
-# ============================================================
-# U-Net architecture configuration
-# ============================================================
-BASE_CHANNELS = 32
-CHANNEL_MULTIPLIERS = (1, 2, 4, 8, 16)
+IMAGE_SIZE = 256
 
-CONV_KERNEL_SIZE = 3
-CONV_PADDING = 1
-CONV_STRIDE = 1
-CONV_LAYERS_PER_BLOCK = 2
-USE_BATCH_NORM = False
-USE_CONV_BIAS = True
-ACTIVATION_INPLACE = True
+NUM_CLASSES = 1
 
-POOL_KERNEL_SIZE = 2
-POOL_STRIDE = 2
-
-UPSAMPLE_KERNEL_SIZE = 2
-UPSAMPLE_STRIDE = 2
-
-OUTPUT_KERNEL_SIZE = 1
-OUTPUT_STRIDE = 1
-OUTPUT_PADDING = 0
-
-# ============================================================
-# Training configuration
-# ============================================================
-BATCH_SIZE = 8
-EPOCHS = 30
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-5
-NUM_WORKERS = 0  # safe default for Windows
-PIN_MEMORY = torch.cuda.is_available()
+VAL_RATIO = 0.15
 RANDOM_SEED = 42
-USE_AMP = False  # can enable later if using a compatible CUDA setup
+
+# Oxford-IIIT Pet trimap:
+# 1 = Pet
+# 2 = Background
+# 3 = Boundary
+#
+# Binary segmentation:
+# 1 -> Foreground
+# 2, 3 -> Background
+
 
 # ============================================================
-# Augmentation and evaluation
+# 3. Model Configuration
 # ============================================================
-USE_HORIZONTAL_FLIP = True
-HORIZONTAL_FLIP_PROBABILITY = 0.5
+
+IN_CHANNELS = 3
+OUT_CHANNELS = 1
+
+# Original U-Net channel configuration
+BASE_CHANNELS = 64
+
+# U-Net encoder channels:
+# 64 -> 128 -> 256 -> 512 -> 1024
+
+
+# ============================================================
+# 4. Training Configuration
+# ============================================================
+
+BATCH_SIZE = 2
+EPOCHS = 100
+
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-5
+
+NUM_WORKERS = 0
+
+USE_AMP = True
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+
+# ============================================================
+# 5. Loss Configuration
+# ============================================================
+
+BCE_WEIGHT = 0.5
+DICE_WEIGHT = 0.5
+
+
+# ============================================================
+# 6. Checkpoint Configuration
+# ============================================================
+
+BEST_MODEL_PATH = CHECKPOINT_DIR / "unet_baseline_best.pth"
+LAST_MODEL_PATH = CHECKPOINT_DIR / "unet_baseline_last.pth"
+
+# Whether to resume from the last checkpoint
+RESUME = True
+
+
+# ============================================================
+# 7. Evaluation Configuration
+# ============================================================
+
 THRESHOLD = 0.5
-SAVE_PREDICTION_LIMIT = 12
 
-# Automatically select CUDA when available, otherwise CPU.
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SAVE_PREDICTIONS = True
+PREDICTION_DIR = RUN_DIR / "predictions"

@@ -1,106 +1,245 @@
-from pathlib import Path
 
-import numpy as np
 import torch
+import numpy as np
+
 from PIL import Image
+
 from torch.utils.data import DataLoader
-from torchvision.transforms import functional as TF
+from torch.amp import autocast
+from tqdm import tqdm
 
 import config
-from dataset import OxfordPetSegmentationDataset
-from model import UNet
-from utils import (
-    calculate_binary_metrics,
-    ensure_directories,
-    load_checkpoint,
-    set_seed,
-)
+from model import build_model
+from dataset import get_dataloaders
 
 
-def save_visualization(image_tensor, mask_tensor, probability_tensor, output_path):
-    """Save a side-by-side image: input, ground truth, predicted mask."""
-    image = image_tensor.cpu().permute(1, 2, 0).numpy()
-    image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
+@torch.no_grad()
+def evaluate(model, loader, device):
 
-    ground_truth = (mask_tensor.cpu().squeeze(0).numpy() * 255).astype(np.uint8)
-    prediction = (probability_tensor.cpu().squeeze(0).numpy() * 255).astype(np.uint8)
+    model.eval()
 
-    image_pil = Image.fromarray(image, mode="RGB")
-    mask_pil = Image.fromarray(ground_truth, mode="L").convert("RGB")
-    pred_pil = Image.fromarray(prediction, mode="L").convert("RGB")
+    total_intersection = 0.0
+    total_pred = 0.0
+    total_target = 0.0
+    total_correct = 0
+    total_pixels = 0
 
-    canvas = Image.new(
-        "RGB",
-        (config.IMAGE_WIDTH * 3, config.IMAGE_HEIGHT),
+    for images, masks in tqdm(loader, desc="Testing"):
+
+        images = images.to(device)
+        masks = masks.to(device)
+
+        with autocast(
+            device_type="cuda",
+            enabled=config.USE_AMP and device.type == "cuda"
+        ):
+
+            outputs = model(images)
+
+        preds = (
+            torch.sigmoid(outputs) >= config.THRESHOLD
+        ).long()
+
+        targets = masks.long()
+
+        total_intersection += (
+            (preds * targets).sum().item()
+        )
+
+        total_pred += preds.sum().item()
+        total_target += targets.sum().item()
+
+        total_correct += (
+            (preds == targets).sum().item()
+        )
+
+        total_pixels += targets.numel()
+
+    dice = (
+        2 * total_intersection + 1e-6
+    ) / (
+        total_pred + total_target + 1e-6
     )
-    canvas.paste(image_pil, (0, 0))
-    canvas.paste(mask_pil, (config.IMAGE_WIDTH, 0))
-    canvas.paste(pred_pil, (config.IMAGE_WIDTH * 2, 0))
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path)
+    union = total_pred + total_target - total_intersection
+
+    iou = (
+        total_intersection + 1e-6
+    ) / (
+        union + 1e-6
+    )
+
+    pixel_accuracy = total_correct / total_pixels
+
+    return {
+        "dice": dice,
+        "iou": iou,
+        "pixel_accuracy": pixel_accuracy
+    }
+
+
+@torch.no_grad()
+def save_predictions(model, loader, device):
+
+    model.eval()
+
+    output_dir = config.PREDICTION_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_index = 0
+
+    for images, masks in tqdm(loader, desc="Saving predictions"):
+
+        images = images.to(device)
+
+        with autocast(
+            device_type="cuda",
+            enabled=config.USE_AMP and device.type == "cuda"
+        ):
+
+            outputs = model(images)
+
+        preds = (
+            torch.sigmoid(outputs) >= config.THRESHOLD
+        ).float()
+
+        images = images.cpu()
+        masks = masks.cpu()
+        preds = preds.cpu()
+
+        for i in range(images.shape[0]):
+
+            image = (
+                images[i].permute(1, 2, 0).numpy() * 255
+            ).clip(0, 255).astype(np.uint8)
+
+            mask = (
+                masks[i, 0].numpy() * 255
+            ).astype(np.uint8)
+
+            pred = (
+                preds[i, 0].numpy() * 255
+            ).astype(np.uint8)
+
+            image_pil = Image.fromarray(image)
+            mask_pil = Image.fromarray(mask)
+            pred_pil = Image.fromarray(pred)
+
+            # Save individual results
+            image_pil.save(
+                output_dir / f"{sample_index}_image.png"
+            )
+
+            mask_pil.save(
+                output_dir / f"{sample_index}_gt.png"
+            )
+
+            pred_pil.save(
+                output_dir / f"{sample_index}_pred.png"
+            )
+
+            # Create comparison image:
+            # Original | Ground Truth | Prediction
+            comparison = Image.new(
+                "RGB",
+                (image_pil.width * 3, image_pil.height)
+            )
+
+            comparison.paste(image_pil, (0, 0))
+            comparison.paste(
+                mask_pil.convert("RGB"),
+                (image_pil.width, 0)
+            )
+            comparison.paste(
+                pred_pil.convert("RGB"),
+                (image_pil.width * 2, 0)
+            )
+
+            comparison.save(
+                output_dir / f"{sample_index}_comparison.png"
+            )
+
+            sample_index += 1
 
 
 def main():
-    ensure_directories()
-    set_seed()
 
-    checkpoint_path = config.CHECKPOINT_DIR / "unet_oxford_pet_best.pth"
-    if not checkpoint_path.exists():
+    device = config.DEVICE
+
+    print("=" * 50)
+    print("U-Net Baseline Testing")
+    print(f"Device: {device}")
+    print("=" * 50)
+
+    if not config.BEST_MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}\n"
-            "Run train.py first, or update the checkpoint path in config.py/test.py."
+            f"Best checkpoint not found: "
+            f"{config.BEST_MODEL_PATH}"
         )
 
-    test_dataset = OxfordPetSegmentationDataset(split="test", augment=False)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY,
+    # Dataset
+    _, _, test_loader = get_dataloaders()
+
+    # Model
+    model = build_model().to(device)
+
+    # Load best checkpoint
+    checkpoint = torch.load(
+        config.BEST_MODEL_PATH,
+        map_location=device,
+        weights_only=True
     )
 
-    model = UNet().to(config.DEVICE)
-    checkpoint = load_checkpoint(model, checkpoint_path, config.DEVICE)
-    model.eval()
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
 
-    total_dice = 0.0
-    total_iou = 0.0
-    total_items = 0
-    saved_count = 0
+    print(f"Loaded checkpoint: {config.BEST_MODEL_PATH}")
+    print(f"Best epoch: {checkpoint['epoch']}")
 
-    with torch.no_grad():
-        for images, masks in test_loader:
-            images = images.to(config.DEVICE, non_blocking=True)
-            masks = masks.to(config.DEVICE, non_blocking=True)
-            logits = model(images)
-            probabilities = torch.sigmoid(logits)
+    # Evaluation
+    metrics = evaluate(
+        model,
+        test_loader,
+        device
+    )
 
-            dice, iou = calculate_binary_metrics(logits, masks)
-            batch_size = images.size(0)
-            total_dice += dice * batch_size
-            total_iou += iou * batch_size
-            total_items += batch_size
+    print("\n" + "=" * 50)
+    print("Final Test Results")
+    print("=" * 50)
 
-            for index in range(batch_size):
-                if saved_count >= config.SAVE_PREDICTION_LIMIT:
-                    break
-                save_visualization(
-                    images[index],
-                    masks[index],
-                    (probabilities[index] >= config.THRESHOLD).float(),
-                    config.PREDICTION_DIR / f"prediction_{saved_count:04d}.png",
-                )
-                saved_count += 1
+    print(f"Dice:            {metrics['dice']:.4f}")
+    print(f"IoU:             {metrics['iou']:.4f}")
+    print(
+        f"Pixel Accuracy:  "
+        f"{metrics['pixel_accuracy']:.4f}"
+    )
 
-    denominator = max(total_items, 1)
-    print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
-    print(f"Test samples: {total_items}")
-    print(f"Test Dice: {total_dice / denominator:.4f}")
-    print(f"Test IoU:  {total_iou / denominator:.4f}")
-    print(f"Visualizations saved to: {config.PREDICTION_DIR}")
+    print("=" * 50)
+
+    # Save metrics
+    result_path = config.RUN_DIR / "test_results.txt"
+
+    with open(result_path, "w", encoding="utf-8") as f:
+
+        f.write("U-Net Baseline Test Results\n")
+        f.write(f"Dice: {metrics['dice']:.6f}\n")
+        f.write(f"IoU: {metrics['iou']:.6f}\n")
+        f.write(
+            f"Pixel Accuracy: "
+            f"{metrics['pixel_accuracy']:.6f}\n"
+        )
+
+    # Save visualizations
+    if config.SAVE_PREDICTIONS:
+
+        save_predictions(
+            model,
+            test_loader,
+            device
+        )
+
+    print(f"\nResults saved to: {config.RUN_DIR}")
 
 
 if __name__ == "__main__":

@@ -1,110 +1,145 @@
-import random
-from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 
-import config
+
+class DiceLoss(nn.Module):
+
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+
+        probs = torch.sigmoid(logits)
+
+        probs = probs.contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+
+        intersection = (probs * targets).sum()
+
+        dice = (
+            2.0 * intersection + self.smooth
+        ) / (
+            probs.sum() + targets.sum() + self.smooth
+        )
+
+        return 1.0 - dice
 
 
-def set_seed(seed=config.RANDOM_SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+class BCEDiceLoss(nn.Module):
 
-
-def ensure_directories():
-    for path in (
-        config.DATA_ROOT,
-        config.DATASET_ROOT,
-        config.CHECKPOINT_DIR,
-        config.OUTPUT_DIR,
-        config.LOG_DIR,
-        config.PREDICTION_DIR,
+    def __init__(
+        self,
+        bce_weight=0.5,
+        dice_weight=0.5
     ):
-        Path(path).mkdir(parents=True, exist_ok=True)
+
+        super().__init__()
+
+        self.bce = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+
+        bce_loss = self.bce(logits, targets)
+        dice_loss = self.dice(logits, targets)
+
+        loss = (
+            self.bce_weight * bce_loss
+            + self.dice_weight * dice_loss
+        )
+
+        return loss
 
 
-def build_loss():
-    # Model returns logits, so use BCEWithLogitsLoss (do not apply sigmoid first).
-    return nn.BCEWithLogitsLoss()
+@torch.no_grad()
+def calculate_metrics(logits, targets, threshold=0.5):
+
+    probs = torch.sigmoid(logits)
+
+    preds = (probs >= threshold).long()
+    targets = targets.long()
+
+    preds = preds.view(-1)
+    targets = targets.view(-1)
+
+    intersection = (preds * targets).sum().float()
+
+    pred_sum = preds.sum().float()
+    target_sum = targets.sum().float()
+
+    union = pred_sum + target_sum - intersection
+
+    total = targets.numel()
+
+    correct = (preds == targets).sum().float()
+
+    dice = (
+        2.0 * intersection + 1e-6
+    ) / (
+        pred_sum + target_sum + 1e-6
+    )
+
+    iou = (
+        intersection + 1e-6
+    ) / (
+        union + 1e-6
+    )
+
+    pixel_accuracy = correct / total
+
+    return {
+        "dice": dice.item(),
+        "iou": iou.item(),
+        "pixel_accuracy": pixel_accuracy.item()
+    }
 
 
-def calculate_binary_metrics(logits, targets, threshold=config.THRESHOLD, eps=1e-7):
-    probabilities = torch.sigmoid(logits)
-    predictions = probabilities >= threshold
-    targets = targets >= 0.5
+def save_checkpoint(
+    model,
+    optimizer,
+    epoch,
+    best_dice,
+    path
+):
 
-    predictions = predictions.bool()
-    targets = targets.bool()
-
-    intersection = (predictions & targets).sum(dim=(1, 2, 3)).float()
-    pred_sum = predictions.sum(dim=(1, 2, 3)).float()
-    target_sum = targets.sum(dim=(1, 2, 3)).float()
-
-    dice = (2 * intersection + eps) / (pred_sum + target_sum + eps)
-    union = (predictions | targets).sum(dim=(1, 2, 3)).float()
-    iou = (intersection + eps) / (union + eps)
-
-    return dice.mean().item(), iou.mean().item()
-
-
-def save_checkpoint(model, optimizer, epoch, val_dice, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "val_dice": val_dice,
-            "config": {
-                "image_height": config.IMAGE_HEIGHT,
-                "image_width": config.IMAGE_WIDTH,
-                "image_channels": config.IMAGE_CHANNELS,
-                "num_classes": config.NUM_CLASSES,
-                "base_channels": config.BASE_CHANNELS,
-                "channel_multipliers": config.CHANNEL_MULTIPLIERS,
-            },
+            "best_dice": best_dice
         },
-        path,
+        path
     )
 
 
-def load_checkpoint(model, path, device=config.DEVICE):
-    checkpoint = torch.load(path, map_location=device)
-    state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict)
-    return checkpoint
+def load_checkpoint(
+    model,
+    optimizer,
+    path,
+    device
+):
 
+    checkpoint = torch.load(
+        path,
+        map_location=device,
+        weights_only=True
+    )
 
-def save_training_curves(history, output_path):
-    """Save loss/Dice curves without requiring plotting during training."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    optimizer.load_state_dict(
+        checkpoint["optimizer_state_dict"]
+    )
 
-    epochs = range(1, len(history["train_loss"]) + 1)
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4))
+    start_epoch = checkpoint["epoch"] + 1
+    best_dice = checkpoint["best_dice"]
 
-    axes[0].plot(epochs, history["train_loss"], label="train")
-    axes[0].plot(epochs, history["val_loss"], label="validation")
-    axes[0].set_title("Loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].legend()
-
-    axes[1].plot(epochs, history["val_dice"], label="validation Dice")
-    axes[1].plot(epochs, history["val_iou"], label="validation IoU")
-    axes[1].set_title("Segmentation metrics")
-    axes[1].set_xlabel("Epoch")
-    axes[1].legend()
-
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=150)
-    plt.close(figure)
+    return model, optimizer, start_epoch, best_dice

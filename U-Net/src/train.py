@@ -1,152 +1,335 @@
+
 import csv
-from pathlib import Path
+import time
 
 import torch
-from torch.utils.data import DataLoader
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.amp import autocast, GradScaler
+from tqdm import tqdm
 
 import config
-from dataset import OxfordPetSegmentationDataset
-from model import UNet
+from model import build_model
+from dataset import get_dataloaders
 from utils import (
-    build_loss,
-    calculate_binary_metrics,
-    ensure_directories,
+    BCEDiceLoss,
+    calculate_metrics,
     save_checkpoint,
-    save_training_curves,
-    set_seed,
+    load_checkpoint
 )
 
 
-def run_epoch(model, loader, criterion, optimizer=None):
-    training = optimizer is not None
-    model.train(training)
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device
+):
+
+    model.train()
 
     total_loss = 0.0
-    total_items = 0
-    dice_sum = 0.0
-    iou_sum = 0.0
 
-    context = torch.enable_grad() if training else torch.no_grad()
-    with context:
-        for images, masks in loader:
-            images = images.to(config.DEVICE, non_blocking=True)
-            masks = masks.to(config.DEVICE, non_blocking=True)
+    progress = tqdm(loader, desc="Train")
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
+    for images, masks in progress:
 
-            logits = model(images)
-            loss = criterion(logits, masks)
+        images = images.to(
+            device, non_blocking=True
+        )
 
-            if training:
-                loss.backward()
-                optimizer.step()
+        masks = masks.to(
+            device, non_blocking=True
+        )
 
-            batch_size = images.size(0)
-            dice, iou = calculate_binary_metrics(logits.detach(), masks)
-            total_loss += loss.item() * batch_size
-            dice_sum += dice * batch_size
-            iou_sum += iou * batch_size
-            total_items += batch_size
+        optimizer.zero_grad(set_to_none=True)
 
-    denominator = max(total_items, 1)
-    return (
-        total_loss / denominator,
-        dice_sum / denominator,
-        iou_sum / denominator,
+        with autocast(
+            device_type="cuda",
+            enabled=config.USE_AMP and device.type == "cuda"
+        ):
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+
+        scaler.scale(loss).backward()
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+        progress.set_postfix(
+            loss=f"{loss.item():.4f}"
+        )
+
+    return total_loss / len(loader)
+
+
+@torch.no_grad()
+def validate(
+    model,
+    loader,
+    criterion,
+    device
+):
+
+    model.eval()
+
+    total_loss = 0.0
+
+    total_intersection = 0.0
+    total_pred = 0.0
+    total_target = 0.0
+    total_correct = 0
+    total_pixels = 0
+
+    progress = tqdm(loader, desc="Validation")
+
+    for images, masks in progress:
+
+        images = images.to(
+            device, non_blocking=True
+        )
+
+        masks = masks.to(
+            device, non_blocking=True
+        )
+
+        with autocast(
+            device_type="cuda",
+            enabled=config.USE_AMP and device.type == "cuda"
+        ):
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+
+        total_loss += loss.item()
+
+        preds = (
+            torch.sigmoid(outputs) >= config.THRESHOLD
+        ).long()
+
+        targets = masks.long()
+
+        total_intersection += (
+            (preds * targets).sum().item()
+        )
+
+        total_pred += preds.sum().item()
+        total_target += targets.sum().item()
+
+        total_correct += (
+            (preds == targets).sum().item()
+        )
+
+        total_pixels += targets.numel()
+
+    dice = (
+        2 * total_intersection + 1e-6
+    ) / (
+        total_pred + total_target + 1e-6
     )
+
+    union = (
+        total_pred + total_target - total_intersection
+    )
+
+    iou = (
+        total_intersection + 1e-6
+    ) / (
+        union + 1e-6
+    )
+
+    pixel_accuracy = total_correct / total_pixels
+
+    return {
+        "loss": total_loss / len(loader),
+        "dice": dice,
+        "iou": iou,
+        "pixel_accuracy": pixel_accuracy
+    }
 
 
 def main():
-    ensure_directories()
-    set_seed()
 
-    print(f"Device: {config.DEVICE}")
-    print(f"Dataset root: {config.DATASET_ROOT}")
+    device = config.DEVICE
 
-    train_dataset = OxfordPetSegmentationDataset(split="train", augment=True)
-    val_dataset = OxfordPetSegmentationDataset(split="val", augment=False)
+    print("=" * 60)
+    print("U-Net Baseline Training")
+    print(f"Device: {device}")
+    print(f"Epochs: {config.EPOCHS}")
+    print(f"Batch Size: {config.BATCH_SIZE}")
+    print(f"Image Size: {config.IMAGE_SIZE}")
+    print("=" * 60)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY,
+    # 1. Dataset
+    train_loader, val_loader, _ = get_dataloaders()
+
+    # 2. Model
+    model = build_model().to(device)
+
+    total_params = sum(
+        p.numel() for p in model.parameters()
     )
 
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Model parameters: {total_params:,}")
 
-    model = UNet().to(config.DEVICE)
-    criterion = build_loss()
-    optimizer = torch.optim.Adam(
+    # 3. Loss
+    criterion = BCEDiceLoss(
+        bce_weight=config.BCE_WEIGHT,
+        dice_weight=config.DICE_WEIGHT
+    )
+
+    # 4. Optimizer
+    optimizer = Adam(
         model.parameters(),
         lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY,
+        weight_decay=config.WEIGHT_DECAY
     )
 
-    best_val_dice = -1.0
-    best_path = config.CHECKPOINT_DIR / "unet_oxford_pet_best.pth"
-    history = {
-        "train_loss": [],
-        "val_loss": [],
-        "val_dice": [],
-        "val_iou": [],
-    }
-    metrics_path = config.LOG_DIR / "training_metrics.csv"
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=0.5,
+        patience=5
+    )
 
-    with open(metrics_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(
-            ["epoch", "train_loss", "val_loss", "val_dice", "val_iou"]
+    scaler = GradScaler(
+        "cuda",
+        enabled=config.USE_AMP and device.type == "cuda"
+    )
+
+    # 5. Resume
+    start_epoch = 1
+    best_dice = 0.0
+
+    if config.RESUME and config.LAST_MODEL_PATH.exists():
+
+        model, optimizer, start_epoch, best_dice = (
+            load_checkpoint(
+                model,
+                optimizer,
+                config.LAST_MODEL_PATH,
+                device
+            )
         )
 
-        for epoch in range(1, config.EPOCHS + 1):
-            train_loss, _, _ = run_epoch(
-                model, train_loader, criterion, optimizer=optimizer
-            )
-            val_loss, val_dice, val_iou = run_epoch(
-                model, val_loader, criterion, optimizer=None
-            )
+        print(f"Resume from epoch {start_epoch}")
 
-            history["train_loss"].append(train_loss)
-            history["val_loss"].append(val_loss)
-            history["val_dice"].append(val_dice)
-            history["val_iou"].append(val_iou)
+    # 6. Training log
+    log_path = config.RUN_DIR / "training_log.csv"
 
-            print(
-                f"Epoch [{epoch}/{config.EPOCHS}] "
-                f"train_loss={train_loss:.4f} "
-                f"val_loss={val_loss:.4f} "
-                f"val_Dice={val_dice:.4f} "
-                f"val_IoU={val_iou:.4f}"
-            )
-            writer.writerow(
-                [epoch, train_loss, val_loss, val_dice, val_iou]
-            )
-            csv_file.flush()
-
-            if val_dice > best_val_dice:
-                best_val_dice = val_dice
-                save_checkpoint(
-                    model, optimizer, epoch, val_dice, best_path
-                )
-                print(f"Saved best checkpoint: {best_path}")
-
-    save_training_curves(
-        history,
-        config.OUTPUT_DIR / "training_curves.png",
+    write_header = (
+        not log_path.exists() or start_epoch == 1
     )
-    print(f"Training complete. Best validation Dice: {best_val_dice:.4f}")
-    print(f"Metrics: {metrics_path}")
+
+    with open(
+        log_path,
+        "a",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        if write_header:
+            writer.writerow([
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "val_dice",
+                "val_iou",
+                "val_pixel_accuracy",
+                "learning_rate"
+            ])
+
+        # 7. Epoch loop
+        for epoch in range(start_epoch, config.EPOCHS + 1):
+
+            start_time = time.time()
+
+            print(f"\nEpoch [{epoch}/{config.EPOCHS}]")
+
+            train_loss = train_one_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                scaler,
+                device
+            )
+
+            val_metrics = validate(
+                model,
+                val_loader,
+                criterion,
+                device
+            )
+
+            scheduler.step(val_metrics["dice"])
+
+            current_lr = optimizer.param_groups[0]["lr"]
+
+            elapsed = time.time() - start_time
+
+            print("-" * 50)
+
+            print(f"Train Loss: {train_loss:.4f}")
+            print(f"Val Loss:   {val_metrics['loss']:.4f}")
+            print(f"Dice:       {val_metrics['dice']:.4f}")
+            print(f"IoU:        {val_metrics['iou']:.4f}")
+            print(
+                f"Pixel Acc:  "
+                f"{val_metrics['pixel_accuracy']:.4f}"
+            )
+            print(f"Learning Rate: {current_lr:.6f}")
+            print(f"Time: {elapsed:.1f}s")
+
+            writer.writerow([
+                epoch,
+                train_loss,
+                val_metrics["loss"],
+                val_metrics["dice"],
+                val_metrics["iou"],
+                val_metrics["pixel_accuracy"],
+                current_lr
+            ])
+
+            f.flush()
+
+            # Save last checkpoint
+            save_checkpoint(
+                model,
+                optimizer,
+                epoch,
+                best_dice,
+                config.LAST_MODEL_PATH
+            )
+
+            # Save best model
+            if val_metrics["dice"] > best_dice:
+
+                best_dice = val_metrics["dice"]
+
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    epoch,
+                    best_dice,
+                    config.BEST_MODEL_PATH
+                )
+
+                print(
+                    f"Best model updated! "
+                    f"Dice: {best_dice:.4f}"
+                )
+
+    print("\nTraining finished.")
+    print(f"Best Validation Dice: {best_dice:.4f}")
+    print(f"Best model: {config.BEST_MODEL_PATH}")
 
 
 if __name__ == "__main__":

@@ -1,148 +1,141 @@
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import config
 
 
-def _make_activation():
-    return nn.ReLU(inplace=config.ACTIVATION_INPLACE)
-
 
 class DoubleConv(nn.Module):
-    """Two convolution layers used throughout the U-Net."""
+    """
+    Original U-Net style:
+    Conv2d -> ReLU -> Conv2d -> ReLU
+    """
 
     def __init__(self, in_channels, out_channels):
+
         super().__init__()
 
-        layers = []
-        current_channels = in_channels
+        self.block = nn.Sequential(
 
-        for _ in range(config.CONV_LAYERS_PER_BLOCK):
-            layers.append(
-                nn.Conv2d(
-                    in_channels=current_channels,
-                    out_channels=out_channels,
-                    kernel_size=config.CONV_KERNEL_SIZE,
-                    stride=config.CONV_STRIDE,
-                    padding=config.CONV_PADDING,
-                    bias=config.USE_CONV_BIAS,
-                )
-            )
-            if config.USE_BATCH_NORM:
-                layers.append(nn.BatchNorm2d(out_channels))
-            layers.append(_make_activation())
-            current_channels = out_channels
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1
+            ),
 
-        self.block = nn.Sequential(*layers)
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1
+            ),
+
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
         return self.block(x)
 
 
+
 class UNet(nn.Module):
-    """Configurable U-Net for binary or multi-class segmentation."""
 
     def __init__(
         self,
-        in_channels=config.IMAGE_CHANNELS,
-        num_classes=config.NUM_CLASSES,
-        base_channels=config.BASE_CHANNELS,
+        in_channels=3,
+        out_channels=1,
+        base_channels=64
     ):
+
         super().__init__()
 
-        multipliers = config.CHANNEL_MULTIPLIERS
-        if len(multipliers) < 2:
-            raise ValueError("CHANNEL_MULTIPLIERS must define encoder and bottleneck widths.")
-
-        channels = [base_channels * multiplier for multiplier in multipliers]
-        self.num_classes = num_classes
+        c = base_channels
 
         # Encoder
-        self.encoders = nn.ModuleList()
-        current_channels = in_channels
-        for out_channels in channels[:-1]:
-            self.encoders.append(DoubleConv(current_channels, out_channels))
-            current_channels = out_channels
+        self.enc1 = DoubleConv(in_channels, c)
+        self.enc2 = DoubleConv(c, c * 2)
+        self.enc3 = DoubleConv(c * 2, c * 4)
+        self.enc4 = DoubleConv(c * 4, c * 8)
 
-        self.pool = nn.MaxPool2d(
-            kernel_size=config.POOL_KERNEL_SIZE,
-            stride=config.POOL_STRIDE,
-        )
+        self.pool = nn.MaxPool2d(kernel_size=2)
 
         # Bottleneck
-        self.bottleneck = DoubleConv(channels[-2], channels[-1])
+        self.bottleneck = DoubleConv(c * 8, c * 16)
 
-        # Decoder: each stage upsamples, concatenates skip features, then fuses them.
-        self.upsamplers = nn.ModuleList()
-        self.decoders = nn.ModuleList()
+        # Decoder
+        self.up4 = nn.ConvTranspose2d(
+            c * 16, c * 8, kernel_size=2, stride=2
+        )
+        self.dec4 = DoubleConv(c * 16, c * 8)
 
-        current_channels = channels[-1]
-        for skip_channels in reversed(channels[:-1]):
-            self.upsamplers.append(
-                nn.ConvTranspose2d(
-                    in_channels=current_channels,
-                    out_channels=skip_channels,
-                    kernel_size=config.UPSAMPLE_KERNEL_SIZE,
-                    stride=config.UPSAMPLE_STRIDE,
-                )
-            )
-            self.decoders.append(
-                DoubleConv(skip_channels * 2, skip_channels)
-            )
-            current_channels = skip_channels
+        self.up3 = nn.ConvTranspose2d(
+            c * 8, c * 4, kernel_size=2, stride=2
+        )
+        self.dec3 = DoubleConv(c * 8, c * 4)
 
+        self.up2 = nn.ConvTranspose2d(
+            c * 4, c * 2, kernel_size=2, stride=2
+        )
+        self.dec2 = DoubleConv(c * 4, c * 2)
+
+        self.up1 = nn.ConvTranspose2d(
+            c * 2, c, kernel_size=2, stride=2
+        )
+        self.dec1 = DoubleConv(c * 2, c)
+
+        # Output
         self.out_conv = nn.Conv2d(
-            in_channels=channels[0],
-            out_channels=num_classes,
-            kernel_size=config.OUTPUT_KERNEL_SIZE,
-            stride=config.OUTPUT_STRIDE,
-            padding=config.OUTPUT_PADDING,
+            c, out_channels, kernel_size=1
         )
 
     def forward(self, x):
-        skip_features = []
 
-        # Encoder: keep feature maps for skip connections.
-        for encoder in self.encoders:
-            x = encoder(x)
-            skip_features.append(x)
-            x = self.pool(x)
+        # Encoder
+        e1 = self.enc1(x)
 
-        x = self.bottleneck(x)
+        e2 = self.enc2(self.pool(e1))
 
-        # Decoder: traverse skips from deepest to shallowest.
-        for upsampler, decoder, skip in zip(
-            self.upsamplers,
-            self.decoders,
-            reversed(skip_features),
-        ):
-            x = upsampler(x)
+        e3 = self.enc3(self.pool(e2))
 
-            # For this implementation, input height and width should be divisible
-            # by 2**number_of_downsampling_stages, which the default 256x256 satisfies.
-            if x.shape[-2:] != skip.shape[-2:]:
-                raise ValueError(
-                    "Input spatial dimensions are incompatible with U-Net pooling. "
-                    f"Upsampled size={tuple(x.shape[-2:])}, "
-                    f"skip size={tuple(skip.shape[-2:])}. "
-                    "Choose dimensions divisible by the total downsampling factor."
-                )
+        e4 = self.enc4(self.pool(e3))
 
-            x = torch.cat((skip, x), dim=1)
-            x = decoder(x)
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))
 
-        return self.out_conv(x)
+        # Decoder + Skip Connections
+        d4 = self.up4(b)
+        d4 = torch.cat([e4, d4], dim=1)
+        d4 = self.dec4(d4)
+
+        d3 = self.up3(d4)
+        d3 = torch.cat([e3, d3], dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.up2(d3)
+        d2 = torch.cat([e2, d2], dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([e1, d1], dim=1)
+        d1 = self.dec1(d1)
+
+        # Return logits, not sigmoid probabilities
+        output = self.out_conv(d1)
+
+        return output
 
 
-if __name__ == "__main__":
-    model = UNet()
-    sample = torch.randn(
-        config.BATCH_SIZE,
-        config.IMAGE_CHANNELS,
-        config.IMAGE_HEIGHT,
-        config.IMAGE_WIDTH,
+def build_model():
+
+    model = UNet(
+        in_channels=config.IN_CHANNELS,
+        out_channels=config.OUT_CHANNELS,
+        base_channels=config.BASE_CHANNELS
     )
-    with torch.no_grad():
-        prediction = model(sample)
-    print(f"Input shape:  {tuple(sample.shape)}")
-    print(f"Output shape: {tuple(prediction.shape)}")
+
+    return model

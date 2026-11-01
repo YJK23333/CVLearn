@@ -1,8 +1,10 @@
 import numpy as np
+import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from config import Config
 from dataset import SiameseMNIST
 from model import EmbeddingNet, SiameseNet
 
@@ -139,15 +141,26 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default="./checkpoints/best.pt")
-    parser.add_argument("--root", default="./data")
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--num-pairs", type=int, default=5000)
+    parser.add_argument("--ckpt", default=os.path.join(Config.ckpt_dir, "best.pt"))
+    parser.add_argument("--root", default=Config.data_root)
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--num-pairs", type=int, default=Config.num_val_pairs)
     args = parser.parse_args()
+
+    # 输出目录确保存在（best.pt 就在这，通常已存在）
+    os.makedirs(Config.ckpt_dir, exist_ok=True)
+
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(
+            f"找不到 checkpoint: {args.ckpt}\n"
+            f"请先运行 train.py，或用 --ckpt 指定正确路径。"
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(args.ckpt, map_location=device)
+    # ⚠️ PyTorch >= 2.6 默认 weights_only=True，ckpt 里存了 dict/float 会炸
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+
     embedding_net = EmbeddingNet(embedding_dim=ckpt["embedding_dim"]).to(device)
     embedding_net.load_state_dict(ckpt["embedding_net"])
     model = SiameseNet(embedding_net).to(device)
@@ -159,17 +172,20 @@ def main():
     val_set = SiameseMNIST(root=args.root, train=False,
                            num_pairs=args.num_pairs, seed=123)
     loader = DataLoader(val_set, batch_size=args.batch_size,
-                        shuffle=False, num_workers=2)
+                        shuffle=False, num_workers=Config.num_workers)
 
     distances, labels = compute_distances(model, loader, device)
     acc, thr = best_threshold(distances, labels)
     print(f"[eval] acc = {acc:.4f}, best threshold = {thr:.4f}")
 
-    # ---------- 可视化 ----------
-    plot_distance_hist(distances, labels, thr, "./checkpoints/dist_hist.png")
-    plot_pairs(model, val_set, device, "./checkpoints/pairs.png", n=8)
-    plot_tsne(model, args.root, device, "./checkpoints/tsne.png")
-
+    # ---------- 可视化（全部输出到 Config.ckpt_dir）----------
+    plot_distance_hist(distances, labels, thr,
+                       os.path.join(Config.ckpt_dir, "dist_hist.png"))
+    plot_pairs(model, val_set, device,
+               os.path.join(Config.ckpt_dir, "pairs.png"), n=8)
+    plot_tsne(model, args.root, device,
+              os.path.join(Config.ckpt_dir, "tsne.png"))
+    
 
 if __name__ == "__main__":
     main()
