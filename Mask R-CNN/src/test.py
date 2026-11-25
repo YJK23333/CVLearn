@@ -58,7 +58,10 @@ def calculate_box_iou(box1, box2):
 
     y2 = min(box1[3], box2[3])
 
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    intersection = (
+        max(0, x2 - x1) *
+        max(0, y2 - y1)
+    )
 
     area1 = (
         (box1[2] - box1[0]) *
@@ -92,7 +95,13 @@ def evaluate(
 
     model.eval()
 
+    # --------------------------------------------------------
+    # Counters
+    # --------------------------------------------------------
+
     total_images = 0
+
+    total_ground_truth = 0
 
     true_positive = 0
 
@@ -100,9 +109,17 @@ def evaluate(
 
     false_negative = 0
 
+    # --------------------------------------------------------
+    # IoU Records
+    # --------------------------------------------------------
+
     mask_ious = []
 
     box_ious = []
+
+    # --------------------------------------------------------
+    # Visualization Directory
+    # --------------------------------------------------------
 
     visualization_dir = os.path.join(
         config.RESULT_DIR,
@@ -119,6 +136,10 @@ def evaluate(
         desc="Testing"
     )
 
+    # ========================================================
+    # Iterate Dataset
+    # ========================================================
+
     for index, (images, targets) in enumerate(progress):
 
         images = [
@@ -132,6 +153,10 @@ def evaluate(
 
         target = targets[0]
 
+        # ----------------------------------------------------
+        # Ground Truth
+        # ----------------------------------------------------
+
         gt_mask = target["masks"][0].bool()
 
         gt_box = target["boxes"][0].cpu().numpy()
@@ -140,6 +165,14 @@ def evaluate(
             target["labels"][0]
         )
 
+        total_images += 1
+
+        total_ground_truth += 1
+
+        # ----------------------------------------------------
+        # Predictions
+        # ----------------------------------------------------
+
         pred_scores = prediction["scores"].cpu()
 
         pred_labels = prediction["labels"].cpu()
@@ -147,6 +180,10 @@ def evaluate(
         pred_boxes = prediction["boxes"].cpu()
 
         pred_masks = prediction["masks"].cpu()
+
+        # ----------------------------------------------------
+        # Filter Predictions
+        # ----------------------------------------------------
 
         valid_indices = [
 
@@ -160,19 +197,15 @@ def evaluate(
             )
         ]
 
-        total_images += 1
-
-        best_iou = 0.0
-
-        best_box_iou = 0.0
-
-        best_index = None
-
         # ----------------------------------------------------
-        # Match prediction with ground truth
+        # Match Predictions with Ground Truth
         # ----------------------------------------------------
+
+        candidates = []
 
         for pred_index in valid_indices:
+
+            # Class must match.
 
             if int(pred_labels[pred_index]) != gt_label:
 
@@ -183,38 +216,91 @@ def evaluate(
                 >= config.MASK_THRESHOLD
             )
 
+            # Mask IoU
+
             mask_iou = calculate_iou(
                 gt_mask,
                 pred_mask
             )
 
-            if mask_iou > best_iou:
+            # Box IoU
 
-                best_iou = mask_iou
+            box_iou = calculate_box_iou(
+                gt_box,
+                pred_boxes[pred_index].numpy()
+            )
 
-                best_index = pred_index
+            candidates.append({
 
-                best_box_iou = calculate_box_iou(
-                    gt_box,
-                    pred_boxes[pred_index].numpy()
-                )
+                "index": pred_index,
 
-        mask_ious.append(best_iou)
+                "score": float(
+                    pred_scores[pred_index]
+                ),
 
-        box_ious.append(best_box_iou)
+                "mask_iou": mask_iou,
+
+                "box_iou": box_iou
+            })
 
         # ----------------------------------------------------
-        # Detection Metrics
+        # Best-Match IoU
         # ----------------------------------------------------
 
-        matched = (
-            best_index is not None
-            and best_iou >= config.IOU_THRESHOLD
+        if len(candidates) > 0:
+
+            best_candidate = max(
+                candidates,
+                key=lambda x: x["mask_iou"]
+            )
+
+            best_mask_iou = best_candidate["mask_iou"]
+
+            best_box_iou = best_candidate["box_iou"]
+
+        else:
+
+            best_mask_iou = 0.0
+
+            best_box_iou = 0.0
+
+        mask_ious.append(
+            best_mask_iou
         )
 
-        if matched:
+        box_ious.append(
+            best_box_iou
+        )
+
+        # ----------------------------------------------------
+        # Detection Matching
+        # ----------------------------------------------------
+
+        matched_candidates = [
+
+            candidate
+
+            for candidate in candidates
+
+            if (
+                candidate["mask_iou"]
+                >= config.IOU_THRESHOLD
+            )
+        ]
+
+        if len(matched_candidates) > 0:
+
+            # Select the highest-confidence
+            # prediction that satisfies the IoU threshold.
+
+            matched_candidate = max(
+                matched_candidates,
+                key=lambda x: x["score"]
+            )
 
             true_positive += 1
+
+            # Every other valid prediction is a false positive.
 
             false_positive += (
                 len(valid_indices) - 1
@@ -222,9 +308,13 @@ def evaluate(
 
         else:
 
-            false_positive += len(valid_indices)
+            # No valid prediction matches the Ground Truth.
 
             false_negative += 1
+
+            # All valid predictions are false positives.
+
+            false_positive += len(valid_indices)
 
         # ----------------------------------------------------
         # Visualization
@@ -244,13 +334,24 @@ def evaluate(
                 save_path
             )
 
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
+
         progress.set_postfix(
-            mask_iou=f"{np.mean(mask_ious):.4f}"
+
+            mask_iou=f"{np.mean(mask_ious):.4f}",
+
+            TP=true_positive,
+
+            FP=false_positive,
+
+            FN=false_negative
         )
 
-    # --------------------------------------------------------
-    # Final Metrics
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. Final Metrics
+    # ========================================================
 
     precision = (
         true_positive /
@@ -259,7 +360,7 @@ def evaluate(
 
     recall = (
         true_positive /
-        max(true_positive + false_negative, 1)
+        max(total_ground_truth, 1)
     )
 
     f1 = (
@@ -275,6 +376,10 @@ def evaluate(
         np.mean(box_ious)
     )
 
+    # ========================================================
+    # 4. Print Results
+    # ========================================================
+
     print("\n" + "=" * 60)
 
     print("Mask R-CNN Test Results")
@@ -282,6 +387,18 @@ def evaluate(
     print("=" * 60)
 
     print(f"Test Images: {total_images}")
+
+    print(f"Ground Truth Instances: {total_ground_truth}")
+
+    print("-" * 60)
+
+    print(f"True Positive: {true_positive}")
+
+    print(f"False Positive: {false_positive}")
+
+    print(f"False Negative: {false_negative}")
+
+    print("-" * 60)
 
     print(f"Mask IoU: {mean_mask_iou:.4f}")
 
@@ -301,7 +418,7 @@ def evaluate(
 
 
 # ============================================================
-# 3. Main
+# 5. Main
 # ============================================================
 
 def main():
@@ -371,6 +488,10 @@ def main():
     print(
         f"Checkpoint epoch: {checkpoint['epoch']}"
     )
+
+    # --------------------------------------------------------
+    # Evaluate
+    # --------------------------------------------------------
 
     evaluate(
         model,
